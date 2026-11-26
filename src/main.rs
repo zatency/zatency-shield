@@ -10,7 +10,14 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{net::SocketAddr, sync::Arc, time::Duration, time::Instant};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use subtle::ConstantTimeEq;
 use tokio::signal;
 use tower_http::trace::TraceLayer;
@@ -33,12 +40,21 @@ static API_KEY_RE: Lazy<Regex> = Lazy::new(|| {
 static CREDIT_CARD_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\b(?:\d[ -]*?){13,16}\b").expect("valid credit card regex"));
 
+#[derive(Default)]
+pub struct ShieldMetrics {
+    pub requests_total: AtomicU64,
+    pub unauthorized_total: AtomicU64,
+    pub blocked_injections_total: AtomicU64,
+    pub pii_redacted_total: AtomicU64,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     http_client: reqwest::Client,
     upstream_url: String,
     upstream_api_key: String,
     expected_gateway_key: Option<String>,
+    metrics: Arc<ShieldMetrics>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -124,6 +140,36 @@ async fn health() -> Json<Value> {
     }))
 }
 
+async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let body = format!(
+        "# HELP zatency_shield_requests_total Total inference requests inspected by Zatency Shield\n\
+         # TYPE zatency_shield_requests_total counter\n\
+         zatency_shield_requests_total {}\n\
+         # HELP zatency_shield_unauthorized_total Total rejected unauthorized requests\n\
+         # TYPE zatency_shield_unauthorized_total counter\n\
+         zatency_shield_unauthorized_total {}\n\
+         # HELP zatency_shield_blocked_injections_total Total prompt injection attempts blocked\n\
+         # TYPE zatency_shield_blocked_injections_total counter\n\
+         zatency_shield_blocked_injections_total {}\n\
+         # HELP zatency_shield_pii_redacted_total Total PII and secret entities scrubbed\n\
+         # TYPE zatency_shield_pii_redacted_total counter\n\
+         zatency_shield_pii_redacted_total {}\n",
+        state.metrics.requests_total.load(Ordering::Relaxed),
+        state.metrics.unauthorized_total.load(Ordering::Relaxed),
+        state
+            .metrics
+            .blocked_injections_total
+            .load(Ordering::Relaxed),
+        state.metrics.pii_redacted_total.load(Ordering::Relaxed),
+    );
+
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+}
+
 async fn proxy_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -131,8 +177,13 @@ async fn proxy_chat_completions(
 ) -> impl IntoResponse {
     let start = Instant::now();
     let request_id = Uuid::new_v4().to_string();
+    state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
 
     if !verify_gateway_auth(&headers, state.expected_gateway_key.as_deref()) {
+        state
+            .metrics
+            .unauthorized_total
+            .fetch_add(1, Ordering::Relaxed);
         warn!(request_id = %request_id, "Unauthorized gateway access attempt");
         return (
             StatusCode::UNAUTHORIZED,
@@ -156,6 +207,10 @@ async fn proxy_chat_completions(
     let mut total_redactions = 0;
     for msg in &mut payload.messages {
         if detect_prompt_injection(&msg.content) {
+            state
+                .metrics
+                .blocked_injections_total
+                .fetch_add(1, Ordering::Relaxed);
             warn!(request_id = %request_id, role = %msg.role, "Blocked prompt injection attempt");
             return (
                 StatusCode::FORBIDDEN,
@@ -172,6 +227,12 @@ async fn proxy_chat_completions(
         total_redactions += redacted;
     }
 
+    if total_redactions > 0 {
+        state
+            .metrics
+            .pii_redacted_total
+            .fetch_add(total_redactions as u64, Ordering::Relaxed);
+    }
     let inspection_us = start.elapsed().as_micros();
 
     // Sovereign Local Sandbox Mode when UPSTREAM_API_KEY is unset
@@ -282,6 +343,7 @@ async fn proxy_chat_completions(
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_endpoint))
         .route("/v1/chat/completions", post(proxy_chat_completions))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
@@ -332,14 +394,15 @@ async fn main() -> Result<()> {
         .build()
         .context("failed to build upstream HTTP client")?;
 
+    let default_upstream = ["https://api.openai.com", "v1"].join("/");
     let state = Arc::new(AppState {
         http_client,
-        upstream_url: std::env::var("UPSTREAM_BASE_URL")
-            .unwrap_or_else(|_| "https://openai.com".to_string()),
+        upstream_url: std::env::var("UPSTREAM_BASE_URL").unwrap_or(default_upstream),
         upstream_api_key: std::env::var("UPSTREAM_API_KEY").unwrap_or_default(),
         expected_gateway_key: std::env::var("SHIELD_GATEWAY_KEY")
             .ok()
             .filter(|s| !s.is_empty()),
+        metrics: Arc::new(ShieldMetrics::default()),
     });
 
     let bind_addr: SocketAddr = std::env::var("BIND_ADDR")
@@ -373,9 +436,10 @@ mod tests {
     fn test_app() -> Router {
         let state = Arc::new(AppState {
             http_client: reqwest::Client::new(),
-            upstream_url: "https://openai.com".to_string(),
+            upstream_url: ["https://api.openai.com", "v1"].join("/"),
             upstream_api_key: String::new(),
             expected_gateway_key: Some("zsk-secret-enterprise-key".to_string()),
+            metrics: Arc::new(ShieldMetrics::default()),
         });
         build_router(state)
     }
@@ -472,5 +536,23 @@ mod tests {
             .unwrap();
         assert!(reply.contains("[REDACTED_EMAIL_1]"));
         assert!(reply.contains("[REDACTED_SSN_2]"));
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint() {
+        let app = test_app();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("zatency_shield_requests_total 0"));
     }
 }
