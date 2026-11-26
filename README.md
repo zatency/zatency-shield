@@ -120,7 +120,14 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 | :--- | :--- | :--- |
 | `UPSTREAM_BASE_URL` | `https://api.openai.com/v1` | Target OpenAI-compatible inference endpoint (OpenAI, vLLM, Ollama, Azure). |
 | `UPSTREAM_API_KEY` | *(empty — runs in Sandbox Mode)* | Upstream bearer token. When omitted, Zatency Shield runs in local echo sandbox mode. |
+| `SHIELD_GATEWAY_KEY` | *(any `zsk-...` token)* | Optional static bearer key enforced via constant-time comparison (`subtle`). |
+| `BIND_ADDR` | `0.0.0.0:8080` | Host IP and TCP port for the gateway HTTP server. |
 | `RUST_LOG` | `info` | Logging verbosity (`debug`, `info`, `warn`, `error`). |
+
+## Observability & Health Endpoints
+
+- **`GET /health`** — Liveness and version readiness check (`200 OK` JSON).
+- **`GET /metrics`** — Prometheus-compatible text metrics (`zatency_shield_requests_total`, `zatency_shield_blocked_injections_total`, `zatency_shield_pii_redacted_total`, `zatency_shield_unauthorized_total`).
 
 ---
 
